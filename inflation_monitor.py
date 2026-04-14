@@ -3,9 +3,11 @@ from __future__ import annotations
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import pickle
 from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 import os
+from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import urljoin
@@ -80,6 +82,11 @@ MONTHLY_CACHE_TTL_SECONDS = 60 * 60 * 6
 CLEVELAND_CACHE_TTL_SECONDS = 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 40
 NBS_MAX_WORKERS = 6
+SNAPSHOT_DIR = Path(".cache")
+MONTHLY_SNAPSHOT_PATH = SNAPSHOT_DIR / "inflation_monitor_monthly_payload.pkl"
+CLEVELAND_SNAPSHOT_PATH = SNAPSHOT_DIR / "inflation_monitor_cleveland_payload.pkl"
+MONTHLY_SNAPSHOT_MAX_AGE_SECONDS = 60 * 60 * 12
+CLEVELAND_SNAPSHOT_MAX_AGE_SECONDS = 60 * 60 * 2
 
 FRESHNESS_RULES = {
     "cleveland_nowcast_month": 7,
@@ -100,6 +107,7 @@ FRED_SERIES = {
     "motor_fuel_cpi": ("CUSR0000SETB01", "CPI Motor Fuel"),
     "henry_hub_gas": ("MHHNGSP", "Henry Hub Natural Gas Spot Price"),
     "utility_gas_cpi": ("CUSR0000SEHF02", "CPI Utility Gas Service"),
+    "apparel_cpi": ("CPIAPPSL", "CPI Apparel"),
     "case_shiller": ("CSUSHPINSA", "Case-Shiller National Home Price Index"),
     "shelter_cpi": ("CUSR0000SAH1", "CPI Shelter"),
     "food_home_cpi": ("CUSR0000SAF11", "CPI Food at Home"),
@@ -117,13 +125,13 @@ DISPLAY_LABELS = {
     "motor_fuel_cpi": "Motor Fuel CPI",
     "henry_hub_gas": "Henry Hub Gas",
     "utility_gas_cpi": "Utility Gas CPI",
+    "apparel_cpi": "Apparel CPI",
     "case_shiller": "Case-Shiller HPI",
     "shelter_cpi": "Shelter CPI",
     "food_home_cpi": "Food-at-Home CPI",
     "fao_food_price_index": "FAO Food Price Index",
     "atlanta_sticky_cpi": "Atlanta Sticky CPI",
     "atlanta_wage_growth": "Atlanta Wage Growth",
-    "ism_prices_paid": "ISM Prices Paid",
     "china_ppi_yoy": "China PPI YoY",
 }
 
@@ -208,6 +216,9 @@ class ValidationReport:
     latest_zscore: float | None = None
     stale_gap_days: int | None = None
     freshness_note: str = ""
+    pass_through_beta: float | None = None
+    pass_through_intercept: float | None = None
+    score_weight: float | None = None
 
 
 LEADING_SPECS: tuple[IndicatorSpec, ...] = (
@@ -256,6 +267,17 @@ LEADING_SPECS: tuple[IndicatorSpec, ...] = (
         note="Natural-gas spot prices are tested against regulated utility-gas CPI with a short lag.",
     ),
     IndicatorSpec(
+        key="china_ppi_to_apparel_cpi",
+        title="China PPI -> Apparel CPI",
+        indicator_key="china_ppi_yoy",
+        target_key="apparel_cpi",
+        indicator_transform="raw",
+        target_transform="yoy",
+        lag_min=0,
+        lag_max=6,
+        note="China factory-gate prices are tested against US apparel CPI as a China-exposed goods channel.",
+    ),
+    IndicatorSpec(
         key="case_shiller_to_shelter",
         title="Case-Shiller -> Shelter CPI",
         indicator_key="case_shiller",
@@ -289,18 +311,6 @@ LEADING_SPECS: tuple[IndicatorSpec, ...] = (
         note="Core producer prices are tested as a lead for core CPI.",
     ),
     IndicatorSpec(
-        key="ism_to_headline_ppi",
-        title="ISM Prices Paid -> Headline PPI",
-        indicator_key="ism_prices_paid",
-        target_key="headline_ppi",
-        indicator_transform="raw",
-        target_transform="yoy",
-        lag_min=0,
-        lag_max=6,
-        note="ISM Prices Paid is treated as an upstream producer-price pipeline signal.",
-        secondary_axis=True,
-    ),
-    IndicatorSpec(
         key="china_ppi_to_import_prices",
         title="China PPI -> Import Prices from China",
         indicator_key="china_ppi_yoy",
@@ -312,6 +322,24 @@ LEADING_SPECS: tuple[IndicatorSpec, ...] = (
         note="China factory-gate prices are tested against US import prices from China.",
     ),
 )
+
+WATCHLIST_KEYS = frozenset(
+    {
+        "headline_ppi_to_headline_cpi",
+        "core_ppi_to_core_cpi",
+    }
+)
+
+MONTHLY_SOURCE_KEYS = frozenset(
+    {
+        *FRED_SERIES.keys(),
+        "fao_food_price_index",
+        "atlanta_wage_growth",
+        "atlanta_sticky_cpi",
+        "china_ppi_yoy",
+    }
+)
+CLEVELAND_SOURCE_KEYS = frozenset({"cleveland_nowcast_month", "cleveland_nowcast_quarter"})
 
 
 def _utc_now() -> pd.Timestamp:
@@ -1115,6 +1143,55 @@ def _source_result_from_payload(payload: dict[str, Any]) -> SourceResult:
     )
 
 
+def _write_snapshot(path: Path, payloads: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bundle = {
+        "saved_at": _serialize_timestamp(_utc_now()),
+        "payloads": payloads,
+    }
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("wb") as handle:
+        pickle.dump(bundle, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temp_path.replace(path)
+
+
+def _read_snapshot(
+    path: Path,
+    *,
+    max_age_seconds: int,
+    allowed_keys: set[str] | frozenset[str] | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            bundle = pickle.load(handle)
+    except Exception:
+        return None
+
+    if not isinstance(bundle, dict):
+        return None
+    saved_at = _deserialize_timestamp(bundle.get("saved_at"))
+    payloads = bundle.get("payloads")
+    if saved_at is None or not isinstance(payloads, dict):
+        return None
+    age_seconds = (_utc_now() - pd.Timestamp(saved_at)).total_seconds()
+    if age_seconds > max_age_seconds:
+        return None
+    if allowed_keys is not None:
+        payloads = {key: value for key, value in payloads.items() if key in allowed_keys}
+        if not payloads or not set(allowed_keys).issubset(payloads.keys()):
+            return None
+    return payloads
+
+
+def _delete_snapshot(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _restore_sources(payloads: dict[str, dict[str, Any]]) -> dict[str, SourceResult]:
     return {
         key: _source_result_from_payload(payload)
@@ -1565,6 +1642,13 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
             base_rate=0.0018,
             scale=0.0018,
         ),
+        "apparel_cpi": _fixture_monthly_level(
+            dates,
+            signal_c.shift(2).bfill(),
+            base=100.0,
+            base_rate=0.0017,
+            scale=0.0011,
+        ),
         "case_shiller": _fixture_monthly_level(
             dates,
             signal_c,
@@ -1686,7 +1770,6 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
     extra_monthly = {
         "fao_food_price_index": ("FAO Food Price Index", FAO_PAGE_URL, levels["fao_food_price_index"]),
         "china_ppi_yoy": ("China PPI YoY", NBS_ARCHIVE_URL, china_ppi_yoy),
-        "ism_prices_paid": ("ISM Prices Paid", ISM_SITEMAP_URL, ism_prices),
         "atlanta_sticky_cpi": ("Atlanta Fed Sticky CPI", ATLANTA_STICKY_CPI_URL, sticky_cpi),
         "atlanta_wage_growth": ("Atlanta Fed Wage Growth Tracker", ATLANTA_WAGE_GROWTH_URL, wage_growth),
     }
@@ -1712,7 +1795,8 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
 
 
 @st.cache_data(ttl=MONTHLY_CACHE_TTL_SECONDS, show_spinner=False)
-def load_monthly_sources() -> dict[str, dict[str, Any]]:
+def load_monthly_sources(_refresh_token: int = 0, force_live: bool = False) -> dict[str, dict[str, Any]]:
+    del _refresh_token
     if _fixture_mode():
         fixture_sources = _build_fixture_sources()
         return {
@@ -1720,6 +1804,15 @@ def load_monthly_sources() -> dict[str, dict[str, Any]]:
             for key, value in fixture_sources.items()
             if not key.startswith("cleveland_nowcast_")
         }
+
+    if not force_live:
+        snapshot = _read_snapshot(
+            MONTHLY_SNAPSHOT_PATH,
+            max_age_seconds=MONTHLY_SNAPSHOT_MAX_AGE_SECONDS,
+            allowed_keys=MONTHLY_SOURCE_KEYS,
+        )
+        if snapshot is not None:
+            return snapshot
 
     session = _new_session()
     results: dict[str, SourceResult] = {}
@@ -1739,7 +1832,6 @@ def load_monthly_sources() -> dict[str, dict[str, Any]]:
         ("fao_food_price_index", "FAO Food Price Index", FAO_PAGE_URL, fetch_fao_food_price_index),
         ("atlanta_wage_growth", "Atlanta Fed Wage Growth Tracker", ATLANTA_WAGE_GROWTH_URL, fetch_atlanta_wage_growth),
         ("atlanta_sticky_cpi", "Atlanta Fed Sticky CPI", ATLANTA_STICKY_CPI_URL, fetch_atlanta_sticky_cpi),
-        ("ism_prices_paid", "ISM Prices Paid", ISM_SITEMAP_URL, fetch_ism_prices_paid),
         ("china_ppi_yoy", "China PPI YoY", NBS_ARCHIVE_URL, fetch_china_ppi_yoy),
     )
     for key, label, url, loader in loaders:
@@ -1748,14 +1840,17 @@ def load_monthly_sources() -> dict[str, dict[str, Any]]:
         except Exception as exc:
             results[key] = _failed_source_result(key, label, url, str(exc))
 
-    return {
+    payloads = {
         key: _source_result_to_payload(value)
         for key, value in results.items()
     }
+    _write_snapshot(MONTHLY_SNAPSHOT_PATH, payloads)
+    return payloads
 
 
 @st.cache_data(ttl=CLEVELAND_CACHE_TTL_SECONDS, show_spinner=False)
-def load_cleveland_sources() -> dict[str, dict[str, Any]]:
+def load_cleveland_sources(_refresh_token: int = 0, force_live: bool = False) -> dict[str, dict[str, Any]]:
+    del _refresh_token
     if _fixture_mode():
         fixture_sources = _build_fixture_sources()
         return {
@@ -1764,16 +1859,27 @@ def load_cleveland_sources() -> dict[str, dict[str, Any]]:
             if key.startswith("cleveland_nowcast_")
         }
 
+    if not force_live:
+        snapshot = _read_snapshot(
+            CLEVELAND_SNAPSHOT_PATH,
+            max_age_seconds=CLEVELAND_SNAPSHOT_MAX_AGE_SECONDS,
+            allowed_keys=CLEVELAND_SOURCE_KEYS,
+        )
+        if snapshot is not None:
+            return snapshot
+
     session = _new_session()
-    return {
+    payloads = {
         key: _source_result_to_payload(value)
         for key, value in fetch_cleveland_nowcast(session).items()
     }
+    _write_snapshot(CLEVELAND_SNAPSHOT_PATH, payloads)
+    return payloads
 
 
-def load_all_sources() -> dict[str, SourceResult]:
-    sources = _restore_sources(load_monthly_sources())
-    sources.update(_restore_sources(load_cleveland_sources()))
+def load_all_sources(refresh_token: int = 0, force_live: bool = False) -> dict[str, SourceResult]:
+    sources = _restore_sources(load_monthly_sources(refresh_token, force_live))
+    sources.update(_restore_sources(load_cleveland_sources(refresh_token, force_live)))
     return sources
 
 
@@ -1933,6 +2039,23 @@ def _choose_best_lag(
     }
 
 
+def _fit_pass_through(frame: pd.DataFrame) -> tuple[float | None, float | None]:
+    if frame.empty or len(frame) < 3:
+        return None, None
+    x = pd.to_numeric(frame["indicator"], errors="coerce")
+    y = pd.to_numeric(frame["target"], errors="coerce")
+    valid = pd.DataFrame({"x": x, "y": y}).dropna()
+    if len(valid) < 3:
+        return None, None
+    variance = float(valid["x"].var(ddof=0))
+    if np.isclose(variance, 0.0):
+        return None, None
+    covariance = float(((valid["x"] - valid["x"].mean()) * (valid["y"] - valid["y"].mean())).mean())
+    beta = covariance / variance
+    intercept = float(valid["y"].mean() - beta * valid["x"].mean())
+    return float(beta), intercept
+
+
 def validate_indicator(spec: IndicatorSpec, sources: dict[str, SourceResult]) -> ValidationReport:
     indicator_source = sources.get(spec.indicator_key)
     target_source = sources.get(spec.target_key)
@@ -2006,6 +2129,13 @@ def validate_indicator(spec: IndicatorSpec, sources: dict[str, SourceResult]) ->
     report.shifted_indicator_frame = _series_to_frame(shifted_indicator, "indicator")
     report.projection_frame = _projection_tail_frame(shifted_indicator, target_series)
     report.rolling_corr_24 = _latest_rolling_corr(report.aligned_frame, window=24)
+    fit_frame = best_train["train"].copy() if isinstance(best_train.get("train"), pd.DataFrame) else report.aligned_frame.copy()
+    beta, intercept = _fit_pass_through(fit_frame)
+    report.pass_through_beta = beta
+    report.pass_through_intercept = intercept
+    fit_corr = best_train["train_corr"] if best_train.get("train_corr") is not None else report.full_corr
+    if fit_corr is not None:
+        report.score_weight = float(max(abs(float(fit_corr)), 0.05))
 
     if report.overlap < 48:
         report.reasons.append("overlap < 48 months")
@@ -2033,7 +2163,13 @@ def build_validation_reports(sources: dict[str, SourceResult]) -> list[Validatio
 def compute_forward_pressure(
     reports: list[ValidationReport],
 ) -> tuple[float | None, pd.DataFrame, str]:
-    approved = [report for report in reports if report.approved and not report.shifted_indicator_frame.empty]
+    approved = [
+        report
+        for report in reports
+        if report.approved
+        and not report.shifted_indicator_frame.empty
+        and report.score_weight is not None
+    ]
     if len(approved) < 3:
         return None, pd.DataFrame(columns=["date", "score"]), "withheld: fewer than 3 approved leading pairs"
 
@@ -2043,15 +2179,26 @@ def compute_forward_pressure(
         rolling_mean = shifted["indicator"].rolling(60, min_periods=24).mean()
         rolling_std = shifted["indicator"].rolling(60, min_periods=24).std()
         z = (shifted["indicator"] - rolling_mean) / rolling_std.replace(0, np.nan)
-        z_frame = pd.DataFrame({"date": shifted["date"], report.key: z})
+        z_frame = pd.DataFrame(
+            {
+                "date": shifted["date"],
+                report.key: z,
+                f"{report.key}__weighted": z * float(report.score_weight),
+                f"{report.key}__weight": np.where(z.notna(), float(report.score_weight), np.nan),
+            }
+        )
         z_frames.append(z_frame)
 
     merged = z_frames[0]
     for frame in z_frames[1:]:
         merged = merged.merge(frame, on="date", how="outer")
-    score_columns = [column for column in merged.columns if column != "date"]
     merged = merged.sort_values("date")
-    merged["score"] = merged[score_columns].mean(axis=1, skipna=True)
+    weighted_columns = [column for column in merged.columns if column.endswith("__weighted")]
+    weight_columns = [column for column in merged.columns if column.endswith("__weight")]
+    score_columns = [column for column in merged.columns if column not in {"date", *weighted_columns, *weight_columns}]
+    merged["weighted_sum"] = merged[weighted_columns].sum(axis=1, skipna=True)
+    merged["weight_sum"] = merged[weight_columns].sum(axis=1, skipna=True)
+    merged["score"] = merged["weighted_sum"] / merged["weight_sum"].replace(0, np.nan)
     merged = merged.dropna(subset=["score"]).reset_index(drop=True)
     if merged.empty:
         return None, pd.DataFrame(columns=["date", "score"]), "withheld: z-score history unavailable"
@@ -2062,7 +2209,7 @@ def compute_forward_pressure(
             valid = merged[["date", report.key]].dropna()
             report.latest_zscore = float(valid[report.key].iloc[-1]) if not valid.empty else None
     horizon = _format_date(pd.to_datetime(merged["date"]).max()) if not merged.empty else "N/A"
-    return latest_score, merged[["date", "score"]], f"{len(approved)} approved pairs | implied through {horizon}"
+    return latest_score, merged[["date", "score"]], f"{len(approved)} approved pairs | pass-through weighted | implied through {horizon}"
 
 
 def build_source_status_frame(sources: dict[str, SourceResult]) -> pd.DataFrame:
@@ -2109,6 +2256,16 @@ def build_rejected_frame(reports: list[ValidationReport]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _watchlist_reports(reports: list[ValidationReport]) -> list[ValidationReport]:
+    return [
+        report
+        for report in reports
+        if report.key in WATCHLIST_KEYS
+        and not report.approved
+        and not report.aligned_frame.empty
+    ]
 
 
 def _format_value(value: float | None, *, suffix: str = "%", decimals: int = 2) -> str:
@@ -2558,6 +2715,7 @@ def render_overview(
         if forward_score is not None and not forward_frame.empty:
             figure = build_forward_pressure_figure(forward_frame, actual_cutoff=actual_cutoff)
             st.plotly_chart(figure, width="stretch", config=PLOTLY_CONFIG)
+            st.caption("Forward Pressure Score는 승인된 선행지표의 historical pass-through 강도로 가중합니다. 아직 headline CPI basket weight까지 보정한 점수는 아닙니다.")
             if actual_cutoff is not None and pd.to_datetime(forward_frame["date"]).max() > pd.Timestamp(actual_cutoff):
                 st.caption(
                     f"점선은 승인된 선행지표를 target month로 이동한 implied future score입니다. "
@@ -2579,10 +2737,10 @@ def render_overview(
 def render_leading_signals(reports: list[ValidationReport]) -> None:
     st.header("Leading Signals")
     approved_reports = [report for report in reports if report.approved]
+    watchlist_reports = _watchlist_reports(reports)
     st.caption(f"승인 {len(approved_reports)}개 / 전체 {len(reports)}개 pair")
     if not approved_reports:
         st.warning("검증 기준을 통과한 선행지표가 아직 없습니다. 하단 Data QA에서 거절 사유를 확인해 주세요.")
-        return
 
     for report in approved_reports:
         title = (
@@ -2619,6 +2777,50 @@ def render_leading_signals(reports: list[ValidationReport]) -> None:
                 f"{report.indicator_label}: {report.source_urls.get(report.indicator_key, '')} | "
                 f"{report.target_label}: {report.source_urls.get(report.target_key, '')}"
             )
+
+    if watchlist_reports:
+        st.subheader("PPI Watchlist")
+        st.caption(
+            "아래 PPI pair는 데이터가 없어서 빠진 것이 아니라, 최근 24개월 상관 약화나 lag 안정성 문제로 승인 기준에서만 탈락한 상태입니다. "
+            "해석 가치는 남아 있으므로 경고와 함께 계속 표시합니다."
+        )
+        for report in watchlist_reports:
+            title = (
+                f"{report.title} | watchlist | lag {report.lag_months}m | hist corr {report.full_corr:.2f}"
+                if report.full_corr is not None
+                else f"{report.title} | watchlist"
+            )
+            with st.expander(title, expanded=False):
+                stat_columns = st.columns(4)
+                stat_columns[0].metric("Lag", f"{report.lag_months}m" if report.lag_months is not None else "N/A")
+                stat_columns[1].metric("Hist Corr", f"{report.full_corr:.2f}" if report.full_corr is not None else "N/A")
+                stat_columns[2].metric("Rolling 24M", f"{report.rolling_corr_24:.2f}" if report.rolling_corr_24 is not None else "N/A")
+                horizon = _format_date(pd.to_datetime(report.projection_frame["date"]).max()) if not report.projection_frame.empty else "N/A"
+                stat_columns[3].metric("Projection To", horizon)
+
+                aligned_view = st.toggle("Aligned View", value=True, key=f"watchlist_aligned_{report.key}")
+                st.plotly_chart(
+                    build_leading_figure(report, aligned_view=aligned_view),
+                    width="stretch",
+                    config=PLOTLY_CONFIG,
+                )
+                if report.reasons:
+                    st.warning(f"Watchlist reason: {'; '.join(report.reasons)}")
+                if aligned_view and not report.projection_frame.empty:
+                    st.caption(
+                        f"점선은 {_format_date(report.latest_target_date)} 이후의 implied future path입니다. "
+                        f"{report.indicator_label}를 {report.lag_months}개월 앞으로 이동한 값입니다."
+                    )
+                    projection_preview = _projection_preview_frame(report, months=6)
+                    if not projection_preview.empty:
+                        st.dataframe(projection_preview, width="stretch", hide_index=True)
+                if report.freshness_note:
+                    st.caption(f"Freshness note: {report.freshness_note}. stale source도 경고와 함께 계속 표시합니다.")
+                st.caption("Historical relationship is still strong, but the recent regime check failed.")
+                st.caption(
+                    f"{report.indicator_label}: {report.source_urls.get(report.indicator_key, '')} | "
+                    f"{report.target_label}: {report.source_urls.get(report.target_key, '')}"
+                )
 
 
 def render_nowcast_persistence(sources: dict[str, SourceResult]) -> None:
@@ -2700,17 +2902,25 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    if "refresh_nonce" not in st.session_state:
+        st.session_state["refresh_nonce"] = 0
+
     control_columns = st.columns([1, 3])
     with control_columns[0]:
         if st.button("Refresh Data", width="stretch"):
             load_monthly_sources.clear()
             load_cleveland_sources.clear()
+            _delete_snapshot(MONTHLY_SNAPSHOT_PATH)
+            _delete_snapshot(CLEVELAND_SNAPSHOT_PATH)
+            st.session_state["refresh_nonce"] += 1
             st.rerun()
     with control_columns[1]:
         if _fixture_mode():
             st.caption("Fixture mode is enabled for deterministic UI/test rendering.")
+        else:
+            st.caption("Warm rerun uses Streamlit cache. Cold start falls back to recent local snapshot files when available.")
 
-    sources = load_all_sources()
+    sources = load_all_sources(refresh_token=st.session_state["refresh_nonce"])
     reports = build_validation_reports(sources)
     forward_score, forward_frame, forward_note = compute_forward_pressure(reports)
 
