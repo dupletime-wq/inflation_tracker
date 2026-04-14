@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from dataclasses import dataclass, field
 from io import BytesIO, StringIO
@@ -78,6 +79,7 @@ PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
 MONTHLY_CACHE_TTL_SECONDS = 60 * 60 * 6
 CLEVELAND_CACHE_TTL_SECONDS = 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 40
+NBS_MAX_WORKERS = 6
 
 FRESHNESS_RULES = {
     "cleveland_nowcast_month": 7,
@@ -196,12 +198,16 @@ class ValidationReport:
     raw_indicator: pd.DataFrame = field(default_factory=pd.DataFrame)
     target_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
     aligned_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    shifted_indicator_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    projection_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
     note: str = ""
     secondary_axis: bool = False
     source_urls: dict[str, str] = field(default_factory=dict)
     latest_indicator_date: pd.Timestamp | None = None
     latest_target_date: pd.Timestamp | None = None
     latest_zscore: float | None = None
+    stale_gap_days: int | None = None
+    freshness_note: str = ""
 
 
 LEADING_SPECS: tuple[IndicatorSpec, ...] = (
@@ -812,35 +818,58 @@ def _parse_nbs_article_html(
     return ({"value": yoy, **common}, {"value": mom, **common})
 
 
+def _fetch_nbs_archive_page(page_number: int) -> tuple[int, list[tuple[str, str]], bool]:
+    session = _new_session()
+    suffix = "index.html" if page_number == 1 else f"index_{page_number}.html"
+    page_url = urljoin(NBS_ARCHIVE_URL, suffix)
+    try:
+        response, insecure_tls = _request(session, page_url)
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 404:
+            return page_number, [], False
+        raise
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    page_links: list[tuple[str, str]] = []
+    seen_page: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        title = anchor.get_text(" ", strip=True)
+        if not _is_nbs_ppi_title(title):
+            continue
+        article_url = urljoin(page_url, anchor["href"])
+        if article_url in seen_page:
+            continue
+        seen_page.add(article_url)
+        page_links.append((article_url, title))
+    return page_number, page_links, insecure_tls
+
+
 def _iter_nbs_archive_links(
     session: requests.Session,
     *,
     max_pages: int = 36,
     max_empty_pages: int = 4,
 ) -> tuple[list[tuple[str, str]], bool]:
+    del session
     links: list[tuple[str, str]] = []
     seen: set[str] = set()
     insecure_used = False
     empty_pages = 0
-    for page_number in range(1, max_pages + 1):
-        suffix = "index.html" if page_number == 1 else f"index_{page_number}.html"
-        page_url = urljoin(NBS_ARCHIVE_URL, suffix)
-        try:
-            response, insecure_tls = _request(session, page_url)
-        except requests.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code == 404:
-                break
-            raise
+    worker_count = min(NBS_MAX_WORKERS, max_pages)
+    page_results: list[tuple[int, list[tuple[str, str]], bool]] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(_fetch_nbs_archive_page, page_number): page_number
+            for page_number in range(1, max_pages + 1)
+        }
+        for future in as_completed(future_map):
+            page_results.append(future.result())
 
+    for _, page_links, insecure_tls in sorted(page_results, key=lambda item: item[0]):
         insecure_used = insecure_used or insecure_tls
-        soup = BeautifulSoup(response.text, "html.parser")
         page_matches = 0
-        for anchor in soup.find_all("a", href=True):
-            title = anchor.get_text(" ", strip=True)
-            if not _is_nbs_ppi_title(title):
-                continue
-            article_url = urljoin(page_url, anchor["href"])
+        for article_url, title in page_links:
             if article_url in seen:
                 continue
             seen.add(article_url)
@@ -995,6 +1024,17 @@ def _parse_nbs_search_result_item(item: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("Could not parse NBS search result snippet.")
 
 
+def _fetch_nbs_yoy_row(article_url: str, title: str) -> tuple[dict[str, Any], bool]:
+    session = _new_session()
+    html, article_insecure = _request_text(session, article_url, timeout=60)
+    yoy_row, _ = _parse_nbs_article_html(
+        html,
+        article_url=article_url,
+        title_hint=title,
+    )
+    return yoy_row, article_insecure
+
+
 def _failed_source_result(
     key: str,
     label: str,
@@ -1113,18 +1153,20 @@ def fetch_china_ppi_yoy(session: requests.Session) -> SourceResult:
         seen.add(article_url)
         combined_links.append((article_url, title))
 
-    for article_url, title in combined_links:
-        try:
-            html, article_insecure = _request_text(session, article_url, timeout=60)
-            insecure_tls = insecure_tls or article_insecure
-            yoy_row, _ = _parse_nbs_article_html(
-                html,
-                article_url=article_url,
-                title_hint=title,
-            )
-            rows.append(yoy_row)
-        except Exception:
-            parse_errors += 1
+    if combined_links:
+        worker_count = min(NBS_MAX_WORKERS, len(combined_links))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(_fetch_nbs_yoy_row, article_url, title): (article_url, title)
+                for article_url, title in combined_links
+            }
+            for future in as_completed(futures):
+                try:
+                    yoy_row, article_insecure = future.result()
+                    insecure_tls = insecure_tls or article_insecure
+                    rows.append(yoy_row)
+                except Exception:
+                    parse_errors += 1
 
     frame = _normalize_monthly_frame(pd.DataFrame(rows))
     detail = (
@@ -1778,6 +1820,53 @@ def _joined(indicator_series: pd.Series, target_series: pd.Series) -> pd.DataFra
     return frame.reset_index()
 
 
+def _series_to_frame(series: pd.Series, column: str) -> pd.DataFrame:
+    if series.empty:
+        return pd.DataFrame(columns=["date", column])
+    frame = pd.DataFrame({"date": pd.to_datetime(series.index), column: pd.to_numeric(series.to_numpy(), errors="coerce")})
+    frame = frame.dropna(subset=["date", column]).sort_values("date").reset_index(drop=True)
+    return frame
+
+
+def _projection_tail_frame(
+    shifted_indicator_series: pd.Series,
+    target_series: pd.Series,
+) -> pd.DataFrame:
+    if shifted_indicator_series.empty:
+        return pd.DataFrame(columns=["date", "indicator"])
+    if target_series.empty:
+        return _series_to_frame(shifted_indicator_series, "indicator")
+    latest_target = pd.Timestamp(target_series.index.max())
+    future = shifted_indicator_series.loc[shifted_indicator_series.index > latest_target]
+    return _series_to_frame(future, "indicator")
+
+
+def _projection_preview_frame(report: ValidationReport, months: int = 6) -> pd.DataFrame:
+    if report.projection_frame.empty:
+        return pd.DataFrame(columns=["month", "implied_value"])
+    preview = report.projection_frame.copy().sort_values("date").head(months)
+    preview["month"] = pd.to_datetime(preview["date"]).dt.strftime("%Y-%m")
+    preview["implied_value"] = preview["indicator"].map(lambda value: _format_value(float(value)))
+    return preview[["month", "implied_value"]]
+
+
+def _source_freshness_reference(source: SourceResult) -> pd.Timestamp | None:
+    reference = source.metadata.get("freshness_reference")
+    parsed = _deserialize_timestamp(reference)
+    if parsed is not None:
+        return parsed
+    if source.latest_observation is None:
+        return None
+    return pd.Timestamp(source.latest_observation) + pd.offsets.MonthEnd(1)
+
+
+def _source_age_days(source: SourceResult) -> int | None:
+    reference = _source_freshness_reference(source)
+    if reference is None:
+        return None
+    return int((_utc_now().normalize() - pd.Timestamp(reference).normalize()).days)
+
+
 def _latest_rolling_corr(frame: pd.DataFrame, window: int = 24) -> float | None:
     if frame.empty or len(frame) < max(3, window):
         return None
@@ -1880,6 +1969,11 @@ def validate_indicator(spec: IndicatorSpec, sources: dict[str, SourceResult]) ->
     report.latest_target_date = target_source.latest_observation
     report.duplicate_months = bool(indicator_source.frame["date"].duplicated().any() or target_source.frame["date"].duplicated().any())
     report.freshness_ok = not indicator_source.stale and not target_source.stale
+    source_age_days = [value for value in (_source_age_days(indicator_source), _source_age_days(target_source)) if value is not None]
+    if source_age_days:
+        report.stale_gap_days = max(source_age_days)
+    if not report.freshness_ok and report.stale_gap_days is not None:
+        report.freshness_note = f"stale by {report.stale_gap_days} days"
 
     indicator_series = _transform_series(_minimal_series(indicator_source), spec.indicator_transform)
     target_series = _transform_series(_minimal_series(target_source), spec.target_transform)
@@ -1908,14 +2002,17 @@ def validate_indicator(spec: IndicatorSpec, sources: dict[str, SourceResult]) ->
     report.holdout_corr = float(best_train["holdout_corr"]) if best_train["holdout_corr"] is not None else None
     report.overlap = int(best_train["overlap"])
     report.aligned_frame = best_train["aligned"].copy()
+    shifted_indicator = _shift_forward(indicator_series, report.lag_months)
+    report.shifted_indicator_frame = _series_to_frame(shifted_indicator, "indicator")
+    report.projection_frame = _projection_tail_frame(shifted_indicator, target_series)
     report.rolling_corr_24 = _latest_rolling_corr(report.aligned_frame, window=24)
 
     if report.overlap < 48:
         report.reasons.append("overlap < 48 months")
     if report.duplicate_months:
         report.reasons.append("duplicate month detected")
-    if not report.freshness_ok:
-        report.reasons.append("freshness check failed")
+    if not report.freshness_ok and (report.stale_gap_days is None or report.stale_gap_days > 92):
+        report.reasons.append("freshness gap > 3 months")
     if report.holdout_best_lag is None:
         report.reasons.append("holdout lag unavailable")
     elif abs(report.train_best_lag - report.holdout_best_lag) > 3:
@@ -1936,17 +2033,17 @@ def build_validation_reports(sources: dict[str, SourceResult]) -> list[Validatio
 def compute_forward_pressure(
     reports: list[ValidationReport],
 ) -> tuple[float | None, pd.DataFrame, str]:
-    approved = [report for report in reports if report.approved and not report.aligned_frame.empty]
+    approved = [report for report in reports if report.approved and not report.shifted_indicator_frame.empty]
     if len(approved) < 3:
         return None, pd.DataFrame(columns=["date", "score"]), "withheld: fewer than 3 approved leading pairs"
 
     z_frames: list[pd.DataFrame] = []
     for report in approved:
-        aligned = report.aligned_frame.copy().sort_values("date")
-        rolling_mean = aligned["indicator"].rolling(60, min_periods=24).mean()
-        rolling_std = aligned["indicator"].rolling(60, min_periods=24).std()
-        z = (aligned["indicator"] - rolling_mean) / rolling_std.replace(0, np.nan)
-        z_frame = pd.DataFrame({"date": aligned["date"], report.key: z})
+        shifted = report.shifted_indicator_frame.copy().sort_values("date")
+        rolling_mean = shifted["indicator"].rolling(60, min_periods=24).mean()
+        rolling_std = shifted["indicator"].rolling(60, min_periods=24).std()
+        z = (shifted["indicator"] - rolling_mean) / rolling_std.replace(0, np.nan)
+        z_frame = pd.DataFrame({"date": shifted["date"], report.key: z})
         z_frames.append(z_frame)
 
     merged = z_frames[0]
@@ -1964,7 +2061,8 @@ def compute_forward_pressure(
         if report.key in merged.columns:
             valid = merged[["date", report.key]].dropna()
             report.latest_zscore = float(valid[report.key].iloc[-1]) if not valid.empty else None
-    return latest_score, merged[["date", "score"]], f"{len(approved)} approved pairs"
+    horizon = _format_date(pd.to_datetime(merged["date"]).max()) if not merged.empty else "N/A"
+    return latest_score, merged[["date", "score"]], f"{len(approved)} approved pairs | implied through {horizon}"
 
 
 def build_source_status_frame(sources: dict[str, SourceResult]) -> pd.DataFrame:
@@ -2093,6 +2191,7 @@ def build_leading_figure(report: ValidationReport, *, aligned_view: bool) -> go.
         x_values = data["date"] if not data.empty else []
         indicator_values = data["indicator"] if not data.empty else []
         target_values = data["target"] if not data.empty else []
+        projection = _filter_plot_range(report.projection_frame, months=120)
         figure = make_subplots(specs=[[{"secondary_y": report.secondary_axis}]])
         figure.add_trace(
             go.Scatter(
@@ -2114,12 +2213,40 @@ def build_leading_figure(report: ValidationReport, *, aligned_view: bool) -> go.
             ),
             secondary_y=report.secondary_axis,
         )
+        if not projection.empty:
+            projection_line = projection.copy()
+            if not data.empty:
+                projection_line = pd.concat(
+                    [
+                        data[["date", "indicator"]].tail(1),
+                        projection[["date", "indicator"]],
+                    ],
+                    ignore_index=True,
+                )
+            figure.add_trace(
+                go.Scatter(
+                    x=projection_line["date"],
+                    y=projection_line["indicator"],
+                    mode="lines+markers",
+                    name=f"{report.target_label} implied path",
+                    line={"color": "#1f5aa6", "width": 3, "dash": "dash"},
+                    marker={"size": 7},
+                ),
+                secondary_y=False,
+            )
+            if report.latest_target_date is not None:
+                figure.add_vline(
+                    x=pd.Timestamp(report.latest_target_date),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="#94a3b8",
+                )
         figure.update_layout(
             template="plotly_white",
             height=360,
             margin={"l": 12, "r": 12, "t": 36, "b": 12},
             legend={"orientation": "h", "y": 1.05},
-            title=f"Aligned View, lag {report.lag_months}m",
+            title=f"Aligned + Projection View, lag {report.lag_months}m",
         )
         return figure
 
@@ -2154,6 +2281,67 @@ def build_leading_figure(report: ValidationReport, *, aligned_view: bool) -> go.
         margin={"l": 12, "r": 12, "t": 36, "b": 12},
         legend={"orientation": "h", "y": 1.05},
         title="Raw View",
+    )
+    return figure
+
+
+def build_forward_pressure_figure(
+    forward_frame: pd.DataFrame,
+    *,
+    actual_cutoff: pd.Timestamp | None,
+) -> go.Figure:
+    chart_frame = _filter_plot_range(forward_frame, months=60)
+    figure = go.Figure()
+    if chart_frame.empty:
+        figure.update_layout(template="plotly_white", height=260, margin={"l": 12, "r": 12, "t": 12, "b": 12})
+        return figure
+
+    if actual_cutoff is not None:
+        actual_cutoff = pd.Timestamp(actual_cutoff)
+        historical = chart_frame.loc[pd.to_datetime(chart_frame["date"]) <= actual_cutoff].copy()
+        projected = chart_frame.loc[pd.to_datetime(chart_frame["date"]) > actual_cutoff].copy()
+    else:
+        historical = chart_frame.copy()
+        projected = pd.DataFrame(columns=chart_frame.columns)
+
+    if not historical.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=historical["date"],
+                y=historical["score"],
+                mode="lines",
+                line={"width": 3, "color": "#d4682d"},
+                name="Forward Pressure Score",
+            )
+        )
+    if not projected.empty:
+        projected_line = projected.copy()
+        if not historical.empty:
+            projected_line = pd.concat(
+                [
+                    historical[["date", "score"]].tail(1),
+                    projected[["date", "score"]],
+                ],
+                ignore_index=True,
+            )
+        figure.add_trace(
+            go.Scatter(
+                x=projected_line["date"],
+                y=projected_line["score"],
+                mode="lines+markers",
+                line={"width": 3, "color": "#d4682d", "dash": "dash"},
+                marker={"size": 7},
+                name="Implied future score",
+            )
+        )
+        if actual_cutoff is not None:
+            figure.add_vline(x=actual_cutoff, line_width=1, line_dash="dot", line_color="#94a3b8")
+
+    figure.update_layout(
+        template="plotly_white",
+        height=260,
+        margin={"l": 12, "r": 12, "t": 12, "b": 12},
+        legend={"orientation": "h", "y": 1.05},
     )
     return figure
 
@@ -2359,27 +2547,22 @@ def render_overview(
     summary_columns = st.columns([1.6, 1.2])
     with summary_columns[0]:
         approved = [report for report in reports if report.approved]
+        actual_cutoff = max(
+            (report.latest_target_date for report in approved if report.latest_target_date is not None),
+            default=None,
+        )
         st.markdown('<span class="section-chip">Source Health</span>', unsafe_allow_html=True)
         st.caption(
             f"OK {health['ok']} | Stale {health['stale']} | Failed {health['failed']} | Insecure TLS fallback {health['insecure']}"
         )
         if forward_score is not None and not forward_frame.empty:
-            chart_frame = _filter_plot_range(forward_frame, months=60)
-            figure = go.Figure(
-                go.Scatter(
-                    x=chart_frame["date"],
-                    y=chart_frame["score"],
-                    mode="lines",
-                    line={"width": 3, "color": "#d4682d"},
-                    name="Forward Pressure Score",
-                )
-            )
-            figure.update_layout(
-                template="plotly_white",
-                height=260,
-                margin={"l": 12, "r": 12, "t": 12, "b": 12},
-            )
+            figure = build_forward_pressure_figure(forward_frame, actual_cutoff=actual_cutoff)
             st.plotly_chart(figure, width="stretch", config=PLOTLY_CONFIG)
+            if actual_cutoff is not None and pd.to_datetime(forward_frame["date"]).max() > pd.Timestamp(actual_cutoff):
+                st.caption(
+                    f"점선은 승인된 선행지표를 target month로 이동한 implied future score입니다. "
+                    f"실제 관측 구간은 {_format_date(actual_cutoff)}까지입니다."
+                )
         else:
             st.info("승인된 선행 pair가 3개 미만이라 composite score를 표시하지 않습니다.")
         st.caption(f"Approved leading pairs: {len(approved)} / {len(reports)}")
@@ -2412,7 +2595,8 @@ def render_leading_signals(reports: list[ValidationReport]) -> None:
             stat_columns[0].metric("Lag", f"{report.lag_months}m")
             stat_columns[1].metric("Aligned Corr", f"{report.full_corr:.2f}" if report.full_corr is not None else "N/A")
             stat_columns[2].metric("Rolling 24M", f"{report.rolling_corr_24:.2f}" if report.rolling_corr_24 is not None else "N/A")
-            stat_columns[3].metric("Overlap", str(report.overlap))
+            horizon = _format_date(pd.to_datetime(report.projection_frame["date"]).max()) if not report.projection_frame.empty else "N/A"
+            stat_columns[3].metric("Projection To", horizon)
 
             aligned_view = st.toggle("Aligned View", value=True, key=f"aligned_{report.key}")
             st.plotly_chart(
@@ -2420,6 +2604,16 @@ def render_leading_signals(reports: list[ValidationReport]) -> None:
                 width="stretch",
                 config=PLOTLY_CONFIG,
             )
+            if aligned_view and not report.projection_frame.empty:
+                st.caption(
+                    f"점선은 {_format_date(report.latest_target_date)} 이후의 implied future path입니다. "
+                    f"{report.indicator_label}를 {report.lag_months}개월 앞으로 이동한 값입니다."
+                )
+                projection_preview = _projection_preview_frame(report, months=6)
+                if not projection_preview.empty:
+                    st.dataframe(projection_preview, width="stretch", hide_index=True)
+            if report.freshness_note:
+                st.caption(f"Freshness note: {report.freshness_note}. stale source도 경고와 함께 계속 표시합니다.")
             st.caption(report.note)
             st.caption(
                 f"{report.indicator_label}: {report.source_urls.get(report.indicator_key, '')} | "
