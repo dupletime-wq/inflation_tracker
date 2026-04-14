@@ -728,6 +728,68 @@ def _failed_source_result(
     )
 
 
+def _serialize_timestamp(value: pd.Timestamp | None) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).isoformat()
+
+
+def _deserialize_timestamp(value: Any) -> pd.Timestamp | None:
+    if value in (None, "", pd.NaT):
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    parsed = pd.Timestamp(parsed)
+    if parsed.tzinfo is not None:
+        parsed = parsed.tz_convert(None)
+    return parsed
+
+
+def _source_result_to_payload(source: SourceResult) -> dict[str, Any]:
+    return {
+        "key": source.key,
+        "label": source.label,
+        "frame": source.frame.copy(deep=True),
+        "source_url": source.source_url,
+        "ok": source.ok,
+        "detail": source.detail,
+        "latest_observation": _serialize_timestamp(source.latest_observation),
+        "fetched_at": _serialize_timestamp(source.fetched_at),
+        "freshness_days": source.freshness_days,
+        "stale": source.stale,
+        "insecure_tls": source.insecure_tls,
+        "metadata": dict(source.metadata),
+    }
+
+
+def _source_result_from_payload(payload: dict[str, Any]) -> SourceResult:
+    frame = payload.get("frame", _empty_monthly_frame())
+    if not isinstance(frame, pd.DataFrame):
+        frame = pd.DataFrame(frame)
+    return SourceResult(
+        key=str(payload.get("key", "")),
+        label=str(payload.get("label", "")),
+        frame=frame.copy(deep=True),
+        source_url=str(payload.get("source_url", "")),
+        ok=bool(payload.get("ok", False)),
+        detail=str(payload.get("detail", "")),
+        latest_observation=_deserialize_timestamp(payload.get("latest_observation")),
+        fetched_at=_deserialize_timestamp(payload.get("fetched_at")),
+        freshness_days=payload.get("freshness_days"),
+        stale=bool(payload.get("stale", False)),
+        insecure_tls=bool(payload.get("insecure_tls", False)),
+        metadata=dict(payload.get("metadata", {})),
+    )
+
+
+def _restore_sources(payloads: dict[str, dict[str, Any]]) -> dict[str, SourceResult]:
+    return {
+        key: _source_result_from_payload(payload)
+        for key, payload in payloads.items()
+    }
+
+
 def fetch_china_ppi_yoy(session: requests.Session) -> SourceResult:
     archive_links, insecure_tls = _iter_nbs_archive_links(session)
     rows: list[dict[str, Any]] = []
@@ -1236,11 +1298,11 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
 
 
 @st.cache_data(ttl=MONTHLY_CACHE_TTL_SECONDS, show_spinner=False)
-def load_monthly_sources() -> dict[str, SourceResult]:
+def load_monthly_sources() -> dict[str, dict[str, Any]]:
     if _fixture_mode():
         fixture_sources = _build_fixture_sources()
         return {
-            key: value
+            key: _source_result_to_payload(value)
             for key, value in fixture_sources.items()
             if not key.startswith("cleveland_nowcast_")
         }
@@ -1272,26 +1334,32 @@ def load_monthly_sources() -> dict[str, SourceResult]:
         except Exception as exc:
             results[key] = _failed_source_result(key, label, url, str(exc))
 
-    return results
+    return {
+        key: _source_result_to_payload(value)
+        for key, value in results.items()
+    }
 
 
 @st.cache_data(ttl=CLEVELAND_CACHE_TTL_SECONDS, show_spinner=False)
-def load_cleveland_sources() -> dict[str, SourceResult]:
+def load_cleveland_sources() -> dict[str, dict[str, Any]]:
     if _fixture_mode():
         fixture_sources = _build_fixture_sources()
         return {
-            key: value
+            key: _source_result_to_payload(value)
             for key, value in fixture_sources.items()
             if key.startswith("cleveland_nowcast_")
         }
 
     session = _new_session()
-    return fetch_cleveland_nowcast(session)
+    return {
+        key: _source_result_to_payload(value)
+        for key, value in fetch_cleveland_nowcast(session).items()
+    }
 
 
 def load_all_sources() -> dict[str, SourceResult]:
-    sources = load_monthly_sources()
-    sources.update(load_cleveland_sources())
+    sources = _restore_sources(load_monthly_sources())
+    sources.update(_restore_sources(load_cleveland_sources()))
     return sources
 
 
