@@ -8,6 +8,7 @@ import os
 import re
 from typing import Any
 from urllib.parse import urljoin
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -38,7 +39,20 @@ DEFAULT_HEADERS = {
 
 FRED_GRAPH_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
 NBS_ARCHIVE_URL = "https://www.stats.gov.cn/english/PressRelease/"
+NBS_SEARCH_URL = "https://www.stats.gov.cn/search/english/s"
 NBS_TITLE_PREFIX = "Industrial Producer Price Indexes in "
+NBS_PPI_TITLE_VARIANTS = (
+    "industrial producer price indexes in ",
+    "producer price index in the industrial sector for ",
+    "producer prices in the industrial sector for ",
+    "producer prices for the industrial sector for ",
+)
+NBS_SEARCH_QUERIES = (
+    "Industrial Producer Price Indexes in",
+    "Producer Price Index in the Industrial Sector",
+    "Producer Prices in the Industrial Sector",
+    "Producer Prices for the Industrial Sector",
+)
 ISM_SITEMAP_URL = "https://www.ismworld.org/sitemap.xml"
 ISM_DIRECT_REPORT_ROOT = (
     "https://www.ismworld.org/supply-management-news-and-reports/"
@@ -80,6 +94,10 @@ FRED_SERIES = {
     "china_import_price": ("CHNTOT", "US Import Price Index from China"),
     "used_vehicle_ppi": ("PCU441110441110102", "PPI Used Vehicle Sales"),
     "used_car_cpi": ("CUSR0000SETA02", "CPI Used Cars and Trucks"),
+    "wti_crude_oil": ("MCOILWTICO", "WTI Crude Oil Spot Price"),
+    "motor_fuel_cpi": ("CUSR0000SETB01", "CPI Motor Fuel"),
+    "henry_hub_gas": ("MHHNGSP", "Henry Hub Natural Gas Spot Price"),
+    "utility_gas_cpi": ("CUSR0000SEHF02", "CPI Utility Gas Service"),
     "case_shiller": ("CSUSHPINSA", "Case-Shiller National Home Price Index"),
     "shelter_cpi": ("CUSR0000SAH1", "CPI Shelter"),
     "food_home_cpi": ("CUSR0000SAF11", "CPI Food at Home"),
@@ -93,6 +111,10 @@ DISPLAY_LABELS = {
     "china_import_price": "Import Prices from China",
     "used_vehicle_ppi": "Used Vehicle PPI",
     "used_car_cpi": "Used Car CPI",
+    "wti_crude_oil": "WTI Crude Oil",
+    "motor_fuel_cpi": "Motor Fuel CPI",
+    "henry_hub_gas": "Henry Hub Gas",
+    "utility_gas_cpi": "Utility Gas CPI",
     "case_shiller": "Case-Shiller HPI",
     "shelter_cpi": "Shelter CPI",
     "food_home_cpi": "Food-at-Home CPI",
@@ -204,6 +226,28 @@ LEADING_SPECS: tuple[IndicatorSpec, ...] = (
         lag_min=0,
         lag_max=6,
         note="Global food input prices can feed into grocery inflation with a short lag.",
+    ),
+    IndicatorSpec(
+        key="wti_to_motor_fuel",
+        title="WTI Crude Oil -> Motor Fuel CPI",
+        indicator_key="wti_crude_oil",
+        target_key="motor_fuel_cpi",
+        indicator_transform="yoy",
+        target_transform="yoy",
+        lag_min=0,
+        lag_max=6,
+        note="Monthly crude prices are tested as an upstream lead for motor-fuel inflation.",
+    ),
+    IndicatorSpec(
+        key="henry_hub_to_utility_gas",
+        title="Henry Hub Gas -> Utility Gas CPI",
+        indicator_key="henry_hub_gas",
+        target_key="utility_gas_cpi",
+        indicator_transform="yoy",
+        target_transform="yoy",
+        lag_min=0,
+        lag_max=6,
+        note="Natural-gas spot prices are tested against regulated utility-gas CPI with a short lag.",
     ),
     IndicatorSpec(
         key="case_shiller_to_shelter",
@@ -343,10 +387,24 @@ def _finalize_source_result(
     if latest_observation is None and not frame.empty:
         if "date" in frame.columns:
             latest_observation = pd.to_datetime(frame["date"], errors="coerce").dropna().max()
+
+    freshness_reference = latest_override
+    if freshness_reference is None and not frame.empty:
+        if "release_date" in frame.columns:
+            release_max = _coerce_datetime(frame["release_date"]).dropna().max()
+            if pd.notna(release_max):
+                freshness_reference = pd.Timestamp(release_max)
+        if freshness_reference is None and latest_observation is not None:
+            freshness_reference = pd.Timestamp(latest_observation) + pd.offsets.MonthEnd(1)
+
     freshness_days = _freshness_days_for_key(key)
     stale = False
-    if latest_observation is not None:
-        stale = (_utc_now().normalize() - latest_observation.normalize()).days > freshness_days
+    if freshness_reference is not None:
+        stale = (_utc_now().normalize() - pd.Timestamp(freshness_reference).normalize()).days > freshness_days
+
+    payload_metadata = dict(metadata or {})
+    if freshness_reference is not None:
+        payload_metadata["freshness_reference"] = _serialize_timestamp(pd.Timestamp(freshness_reference))
 
     return SourceResult(
         key=key,
@@ -360,7 +418,7 @@ def _finalize_source_result(
         freshness_days=freshness_days,
         stale=stale,
         insecure_tls=insecure_tls,
-        metadata=metadata or {},
+        metadata=payload_metadata,
     )
 
 
@@ -374,14 +432,34 @@ def _request(
     session: requests.Session,
     url: str,
     *,
+    method: str = "GET",
+    params: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[requests.Response, bool]:
     try:
-        response = session.get(url, timeout=timeout, verify=True)
+        response = session.request(
+            method,
+            url,
+            params=params,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            verify=True,
+        )
         response.raise_for_status()
         return response, False
     except (requests.exceptions.SSLError, requests.exceptions.Timeout):
-        response = session.get(url, timeout=timeout, verify=False)
+        response = session.request(
+            method,
+            url,
+            params=params,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            verify=False,
+        )
         response.raise_for_status()
         return response, True
 
@@ -594,33 +672,101 @@ def _signed_value(verb: str, value: float | None) -> float:
         return 0.0
     if value is None:
         raise ValueError("Directional value missing.")
-    negative_tokens = ("decrease", "declin", "fell", "drop")
+    negative_tokens = ("decrease", "declin", "fell", "drop", "down")
     return -float(value) if any(token in normalized for token in negative_tokens) else float(value)
 
 
+def _is_nbs_ppi_title(title: str) -> bool:
+    normalized = re.sub(r"^\d+\.\s*", "", title.strip()).lower()
+    return any(token in normalized for token in NBS_PPI_TITLE_VARIANTS)
+
+
+def _normalize_nbs_metric_text(text: str) -> str:
+    normalized = BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)
+    normalized = normalized.replace("\xa0", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"(\d+)\s+(\d+)(?=\s+(?:percent|%))", r"\1.\2", normalized, flags=re.IGNORECASE)
+    return normalized.strip()
+
+
+def _parse_metric_number(value: str | None) -> float | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().replace(" ", ".")
+    return float(normalized) if normalized else None
+
+
 def _try_parse_nbs_paragraph_metric(text: str, mode: str) -> float | None:
+    text = _normalize_nbs_metric_text(text)
+    metric_pattern = r"\d+(?:[.\s]\d+)?"
+    yoy_pattern = r"year[- ]on(?:[- ]year)?"
+    mom_pattern = r"month[- ]on(?:[- ]month)?"
     if mode == "yoy":
-        pattern = re.compile(
-            r"producer price index for industrial products \(PPI\)\s+"
-            r"(?P<verb>decreased|declined|fell|dropped|increased|rose|grew|"
-            r"remained unchanged|remained flat|was flat)"
-            r"(?:\s+by\s+(?P<value>\d+(?:\.\d+)?))?(?:\s+percent|%)?\s+year on year",
-            re.IGNORECASE,
+        patterns = (
+            re.compile(
+                r"producer price index for industrial products \(ppi\)\s+"
+                r"(?P<verb>decreased|declined|fell|dropped|increased|rose|grew|"
+                r"remained unchanged|remained flat|was flat)"
+                rf"(?:\s+by\s+(?P<value>{metric_pattern}))?(?:\s+percent|%)?\s+{yoy_pattern}",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"producer price index(?:\s*\(ppi\)|\s+ppi)? for manufactured goods\s+"
+                r"(?P<verb>decreased|declined|fell|dropped|increased|rose|grew|"
+                r"remained unchanged|remained flat|was flat)"
+                rf"(?:\s+by\s+(?P<value>{metric_pattern}))?(?:\s+percent|%)?\s+{yoy_pattern}",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"(?:the national\s+)?producer prices? for industrial products\s+"
+                r"(?P<verb>went up|went down|decreased|declined|fell|dropped|increased|rose|grew|"
+                r"remained unchanged|remained flat|was flat)"
+                rf"(?:\s+by\s+(?P<value>{metric_pattern}))?(?:\s+percent|%)?\s+{yoy_pattern}",
+                re.IGNORECASE,
+            ),
         )
     else:
-        pattern = re.compile(
-            r"(?:it|and|and it|the producer price index for industrial products)?\s*"
-            r"(?P<verb>decreased|declined|fell|dropped|increased|rose|grew|"
-            r"remained unchanged|remained flat|was flat)"
-            r"(?:\s+by\s+(?P<value>\d+(?:\.\d+)?))?(?:\s+percent|%)?\s+month on month",
-            re.IGNORECASE,
+        patterns = (
+            re.compile(
+                r"(?:it|and|and it|the producer price index for industrial products)?\s*"
+                r"(?P<verb>decreased|declined|fell|dropped|increased|rose|grew|"
+                r"remained unchanged|remained flat|was flat)"
+                rf"(?:\s+by\s+(?P<value>{metric_pattern}))?(?:\s+percent|%)?\s+{mom_pattern}",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"(?:it|and|and it|producer price index(?:\s*\(ppi\)|\s+ppi)? for manufactured goods)?\s*"
+                r"(?P<verb>decreased|declined|fell|dropped|increased|rose|grew|"
+                r"remained unchanged|remained flat|was flat)"
+                rf"(?:\s+by\s+(?P<value>{metric_pattern}))?(?:\s+percent|%)?\s+{mom_pattern}",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"(?:the national\s+)?producer prices? for industrial products\s+"
+                r"(?P<verb>went up|went down|decreased|declined|fell|dropped|increased|rose|grew|"
+                r"remained unchanged|remained flat|was flat)"
+                rf"(?:\s+by\s+(?P<value>{metric_pattern}))?(?:\s+percent|%)?\s+{mom_pattern}",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"producer price index(?:\s*\(ppi\)|\s+ppi)? for manufactured goods\s+"
+                rf"(?:decreased|declined|fell|dropped|increased|rose|grew|went up|went down)\s+by\s+{metric_pattern}"
+                rf"(?:\s+percent|%)?\s+{yoy_pattern}\s+and\s+(?P<value>"
+                rf"{metric_pattern})"
+                rf"(?:\s+percent|%)?\s+{mom_pattern}",
+                re.IGNORECASE,
+            ),
         )
 
-    match = pattern.search(text)
-    if not match:
-        return None
-    value = match.group("value")
-    return _signed_value(match.group("verb"), float(value) if value is not None else None)
+    for pattern in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        value = match.group("value")
+        if "verb" not in pattern.groupindex:
+            return _parse_metric_number(value)
+        return _signed_value(match.group("verb"), _parse_metric_number(value))
+    return None
 
 
 def _try_parse_nbs_table_values(text: str) -> tuple[float | None, float | None]:
@@ -646,9 +792,9 @@ def _parse_nbs_article_html(
     soup = BeautifulSoup(html, "html.parser")
     title_node = soup.find(["h1", "h2"])
     title_text = title_node.get_text(" ", strip=True) if title_node else title_hint
-    text = " ".join(soup.stripped_strings)
+    text = _normalize_nbs_metric_text(" ".join(soup.stripped_strings))
 
-    observation_date = _parse_observation_month(title_text.replace(NBS_TITLE_PREFIX, ""))
+    observation_date = _parse_observation_month(re.sub(r"^\d+\.\s*", "", title_text))
     release_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
     release_date = pd.to_datetime(release_match.group(1)) if release_match else pd.NaT
 
@@ -670,10 +816,12 @@ def _iter_nbs_archive_links(
     session: requests.Session,
     *,
     max_pages: int = 36,
+    max_empty_pages: int = 4,
 ) -> tuple[list[tuple[str, str]], bool]:
     links: list[tuple[str, str]] = []
     seen: set[str] = set()
     insecure_used = False
+    empty_pages = 0
     for page_number in range(1, max_pages + 1):
         suffix = "index.html" if page_number == 1 else f"index_{page_number}.html"
         page_url = urljoin(NBS_ARCHIVE_URL, suffix)
@@ -687,20 +835,164 @@ def _iter_nbs_archive_links(
 
         insecure_used = insecure_used or insecure_tls
         soup = BeautifulSoup(response.text, "html.parser")
-        found_on_page = 0
+        page_matches = 0
         for anchor in soup.find_all("a", href=True):
             title = anchor.get_text(" ", strip=True)
-            if NBS_TITLE_PREFIX not in title:
+            if not _is_nbs_ppi_title(title):
                 continue
             article_url = urljoin(page_url, anchor["href"])
             if article_url in seen:
                 continue
             seen.add(article_url)
             links.append((article_url, title))
-            found_on_page += 1
-        if found_on_page == 0 and page_number > 5:
-            break
+            page_matches += 1
+        if page_matches == 0 and links:
+            empty_pages += 1
+            if empty_pages >= max_empty_pages:
+                break
+        else:
+            empty_pages = 0
     return links, insecure_used
+
+
+def _extract_nbs_search_bootstrap(html: str) -> dict[str, str]:
+    match = re.search(
+        r"initPubProperty\(\s*'(?P<site_code>[^']+)'\s*,\s*'(?P<tab>[^']+)'\s*,\s*'(?P<qt>[^']*)'\s*,\s*"
+        r"'(?P<debug>[^']*)'\s*,\s*'(?P<page>[^']+)'\s*,\s*'(?P<page_size>[^']+)'\s*,\s*"
+        r"'(?P<timestamp>[^']+)'\s*,\s*'(?P<word_token>[^']+)'\s*,\s*'(?P<tab_token>[^']+)'\s*,\s*"
+        r"attrs,\s*'(?P<api_url>[^']+)'.*?'(?P<suid>[^']+)'\s*\)",
+        html,
+        re.S,
+    )
+    if not match:
+        raise ValueError("NBS search bootstrap not found.")
+    return {
+        "siteCode": match.group("site_code"),
+        "tab": match.group("tab"),
+        "page": match.group("page"),
+        "pageSize": match.group("page_size"),
+        "timestamp": match.group("timestamp"),
+        "wordToken": match.group("word_token"),
+        "tabToken": match.group("tab_token"),
+        "apiUrl": match.group("api_url"),
+        "suid": match.group("suid"),
+    }
+
+
+def _iter_nbs_search_results(
+    session: requests.Session,
+    *,
+    queries: tuple[str, ...] = NBS_SEARCH_QUERIES,
+    page_size: int = 50,
+    max_pages: int = 8,
+) -> tuple[list[dict[str, Any]], bool]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    insecure_used = False
+    stagnant_queries = 0
+
+    for query in queries:
+        before_query = len(results)
+        search_url = f"{NBS_SEARCH_URL}?{urlencode({'qt': query})}"
+        html, search_insecure = _request_text(session, search_url, timeout=90)
+        insecure_used = insecure_used or search_insecure
+        bootstrap = _extract_nbs_search_bootstrap(html)
+
+        first_payload = {
+            "siteCode": bootstrap["siteCode"],
+            "tab": bootstrap["tab"],
+            "timestamp": bootstrap["timestamp"],
+            "wordToken": bootstrap["wordToken"],
+            "page": 1,
+            "pageSize": page_size,
+            "qt": query,
+        }
+        response, api_insecure = _request(
+            session,
+            urljoin(bootstrap["apiUrl"], "s"),
+            method="POST",
+            data=first_payload,
+            headers={"suid": bootstrap["suid"]},
+            timeout=90,
+        )
+        insecure_used = insecure_used or api_insecure
+        payload = response.json()
+        total_hits = int(payload.get("data", {}).get("search", {}).get("totalHits", 0))
+        total_pages = min(max_pages, max(1, int(np.ceil(total_hits / page_size)) if total_hits else 1))
+
+        def collect_items(items: list[dict[str, Any]]) -> None:
+            for item in items:
+                title = str(item.get("title", "")).strip()
+                article_url = str(item.get("viewUrl", "")).strip().replace("http://", "https://")
+                if not title or not article_url:
+                    continue
+                if "/english/PressRelease/" not in article_url:
+                    continue
+                if not _is_nbs_ppi_title(title):
+                    continue
+                if article_url in seen:
+                    continue
+                seen.add(article_url)
+                quick_description = str(item.get("myValues", {}).get("QUICKDESCRIPTION", "")).strip()
+                summary = str(item.get("summary", "")).strip()
+                doc_date = str(item.get("docDate", "")).strip()
+                results.append(
+                    {
+                        "url": article_url,
+                        "title": title,
+                        "quick_description": quick_description,
+                        "summary": summary,
+                        "doc_date": doc_date,
+                    }
+                )
+
+        collect_items(payload.get("data", {}).get("search", {}).get("searchs", []))
+
+        for page_number in range(2, total_pages + 1):
+            page_payload = dict(first_payload)
+            page_payload["page"] = page_number
+            response, page_insecure = _request(
+                session,
+                urljoin(bootstrap["apiUrl"], "s"),
+                method="POST",
+                data=page_payload,
+                headers={"suid": bootstrap["suid"]},
+                timeout=90,
+            )
+            insecure_used = insecure_used or page_insecure
+            page_data = response.json()
+            collect_items(page_data.get("data", {}).get("search", {}).get("searchs", []))
+
+        if len(results) == before_query and results:
+            stagnant_queries += 1
+            if stagnant_queries >= 2:
+                break
+        else:
+            stagnant_queries = 0
+
+    return results, insecure_used
+
+
+def _parse_nbs_search_result_item(item: dict[str, Any]) -> dict[str, Any]:
+    title = str(item.get("title", "")).strip()
+    observation_date = _parse_observation_month(re.sub(r"^\d+\.\s*", "", title))
+    release_date = _coerce_datetime(pd.Series([item.get("doc_date")])).iloc[0]
+    text_candidates = [
+        _normalize_nbs_metric_text(str(item.get("quick_description", ""))),
+        _normalize_nbs_metric_text(str(item.get("summary", ""))),
+    ]
+    for candidate in text_candidates:
+        if not candidate:
+            continue
+        yoy = _try_parse_nbs_paragraph_metric(candidate, "yoy")
+        if yoy is None:
+            continue
+        return {
+            "date": observation_date,
+            "value": yoy,
+            "release_date": release_date,
+        }
+    raise ValueError("Could not parse NBS search result snippet.")
 
 
 def _failed_source_result(
@@ -791,13 +1083,39 @@ def _restore_sources(payloads: dict[str, dict[str, Any]]) -> dict[str, SourceRes
 
 
 def fetch_china_ppi_yoy(session: requests.Session) -> SourceResult:
-    archive_links, insecure_tls = _iter_nbs_archive_links(session)
+    search_results, search_insecure = _iter_nbs_search_results(session)
+    archive_links, archive_insecure = _iter_nbs_archive_links(session, max_pages=25)
+    insecure_tls = search_insecure or archive_insecure
     rows: list[dict[str, Any]] = []
     parse_errors = 0
+    parsed_urls: set[str] = set()
 
-    for article_url, title in archive_links:
+    for item in search_results:
         try:
-            html, article_insecure = _request_text(session, article_url)
+            rows.append(_parse_nbs_search_result_item(item))
+            parsed_urls.add(str(item.get("url", "")))
+        except Exception:
+            parse_errors += 1
+
+    combined_links: list[tuple[str, str]] = []
+    seen: set[str] = set(parsed_urls)
+    for article_url, title in archive_links:
+        if article_url in seen:
+            continue
+        seen.add(article_url)
+        combined_links.append((article_url, title))
+
+    for item in search_results:
+        article_url = str(item.get("url", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if not article_url or article_url in parsed_urls or article_url in seen:
+            continue
+        seen.add(article_url)
+        combined_links.append((article_url, title))
+
+    for article_url, title in combined_links:
+        try:
+            html, article_insecure = _request_text(session, article_url, timeout=60)
             insecure_tls = insecure_tls or article_insecure
             yoy_row, _ = _parse_nbs_article_html(
                 html,
@@ -810,7 +1128,7 @@ def fetch_china_ppi_yoy(session: requests.Session) -> SourceResult:
 
     frame = _normalize_monthly_frame(pd.DataFrame(rows))
     detail = (
-        f"parsed {len(frame)} monthly observations from {len(archive_links)} archive links"
+        f"parsed {len(frame)} monthly observations from {len(combined_links)} official links"
         if not frame.empty
         else f"no parseable NBS articles (errors={parse_errors})"
     )
@@ -818,11 +1136,14 @@ def fetch_china_ppi_yoy(session: requests.Session) -> SourceResult:
         "china_ppi_yoy",
         "China PPI YoY",
         frame,
-        NBS_ARCHIVE_URL,
+        NBS_SEARCH_URL,
         insecure_tls=insecure_tls,
         detail=detail,
         metadata={
+            "search_results": len(search_results),
+            "search_snippet_rows": len(parsed_urls),
             "archive_links": len(archive_links),
+            "combined_links": len(combined_links),
             "parse_errors": parse_errors,
         },
     )
@@ -882,7 +1203,17 @@ def _looks_like_login_page(text: str, *, final_url: str) -> bool:
     lowered = text.lower()
     return any(
         token in lowered or token in final_url.lower()
-        for token in ("sign in", "login", "single sign on", "/login")
+        for token in (
+            "sign in",
+            "login",
+            "single sign on",
+            "/login",
+            "captcha_form",
+            "grecaptcha",
+            "captcha_resp",
+            "recaptcha",
+            "ecommerce.ismworld.org",
+        )
     )
 
 
@@ -890,11 +1221,12 @@ def _fetch_ism_direct_pages(
     session: requests.Session,
     *,
     months_back: int = 12,
-) -> tuple[pd.DataFrame, bool, int]:
+) -> tuple[pd.DataFrame, bool, int, bool]:
     rows: list[dict[str, Any]] = []
     insecure_tls = False
     parse_failures = 0
     seen_urls: set[str] = set()
+    blocked = False
 
     periods = pd.period_range(end=_utc_now().to_period("M"), periods=months_back, freq="M")
     for period in periods[::-1]:
@@ -913,7 +1245,8 @@ def _fetch_ism_direct_pages(
         text = response.text
         if _looks_like_login_page(text, final_url=str(response.url)):
             parse_failures += 1
-            continue
+            blocked = True
+            break
 
         value = _parse_ism_prices_from_text(text)
         observation = _parse_ism_observation_from_url(str(response.url))
@@ -929,7 +1262,7 @@ def _fetch_ism_direct_pages(
             }
         )
 
-    return _normalize_monthly_frame(pd.DataFrame(rows)), insecure_tls, parse_failures
+    return _normalize_monthly_frame(pd.DataFrame(rows)), insecure_tls, parse_failures, blocked
 
 
 def _extract_pdf_links_from_html(html: str, *, page_url: str) -> list[str]:
@@ -951,7 +1284,7 @@ def _fetch_ism_roundup_pages(
     session: requests.Session,
     *,
     max_urls: int = 96,
-) -> tuple[pd.DataFrame, bool, int]:
+) -> tuple[pd.DataFrame, bool, int, bool]:
     xml_text, insecure_tls = _request_text(session, ISM_SITEMAP_URL, timeout=90)
     urls = re.findall(r"<loc>([^<]+)</loc>", xml_text)
     filtered_urls = [
@@ -963,6 +1296,7 @@ def _fetch_ism_roundup_pages(
 
     rows: list[dict[str, Any]] = []
     parse_failures = 0
+    blocked = False
     for page_url in filtered_urls[:max_urls]:
         observation = _parse_ism_observation_from_url(page_url)
         if observation is None:
@@ -978,7 +1312,8 @@ def _fetch_ism_roundup_pages(
         html = response.text
         if _looks_like_login_page(html, final_url=str(response.url)):
             parse_failures += 1
-            continue
+            blocked = True
+            break
 
         parsed = _parse_ism_prices_from_text(html)
         if parsed is None:
@@ -1006,16 +1341,21 @@ def _fetch_ism_roundup_pages(
         )
 
     frame = _normalize_monthly_frame(pd.DataFrame(rows))
-    return frame, insecure_tls, parse_failures
+    return frame, insecure_tls, parse_failures, blocked
 
 
 def fetch_ism_prices_paid(session: requests.Session) -> SourceResult:
-    direct_frame, direct_insecure, direct_failures = _fetch_ism_direct_pages(session)
-    roundup_frame, roundup_insecure, roundup_failures = _fetch_ism_roundup_pages(session)
+    direct_frame, direct_insecure, direct_failures, direct_blocked = _fetch_ism_direct_pages(session)
+    roundup_frame, roundup_insecure, roundup_failures, roundup_blocked = _fetch_ism_roundup_pages(session)
 
     combined = pd.concat([direct_frame, roundup_frame], ignore_index=True)
     frame = _normalize_monthly_frame(combined)
     detail = (
+        "official ISM pages returned a captcha/login wall; "
+        if frame.empty and (direct_blocked or roundup_blocked)
+        else ""
+    )
+    detail += (
         f"roundup_rows={len(roundup_frame)}, direct_rows={len(direct_frame)}, "
         f"roundup_failures={roundup_failures}, direct_failures={direct_failures}"
     )
@@ -1031,6 +1371,8 @@ def fetch_ism_prices_paid(session: requests.Session) -> SourceResult:
             "roundup_rows": len(roundup_frame),
             "direct_failures": direct_failures,
             "roundup_failures": roundup_failures,
+            "direct_blocked": direct_blocked,
+            "roundup_blocked": roundup_blocked,
         },
     )
 
@@ -1127,6 +1469,8 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
     signal_b = pd.Series(np.cos(base_index / 1.5) + 0.08 * np.linspace(-1.0, 1.0, len(dates)), index=dates)
     signal_c = pd.Series(np.sin(base_index / 1.9) + 0.1 * np.linspace(0.0, 1.0, len(dates)), index=dates)
     signal_d = pd.Series(np.cos(base_index / 2.5) + 0.1 * np.sin(base_index / 4.0), index=dates)
+    signal_e = pd.Series(np.sin(base_index / 1.35) + 0.18 * np.cos(base_index / 3.2), index=dates)
+    signal_f = pd.Series(np.cos(base_index / 1.15) + 0.12 * np.sin(base_index / 2.8), index=dates)
 
     levels = {
         "used_vehicle_ppi": _fixture_monthly_level(dates, signal_a, base=100.0, base_rate=0.0026, scale=0.0014),
@@ -1150,6 +1494,34 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
             base=100.0,
             base_rate=0.0020,
             scale=0.0011,
+        ),
+        "wti_crude_oil": _fixture_monthly_level(
+            dates,
+            signal_e,
+            base=72.0,
+            base_rate=0.0018,
+            scale=0.0030,
+        ),
+        "motor_fuel_cpi": _fixture_monthly_level(
+            dates,
+            signal_e.shift(2).bfill(),
+            base=100.0,
+            base_rate=0.0019,
+            scale=0.0021,
+        ),
+        "henry_hub_gas": _fixture_monthly_level(
+            dates,
+            signal_f,
+            base=4.0,
+            base_rate=0.0022,
+            scale=0.0028,
+        ),
+        "utility_gas_cpi": _fixture_monthly_level(
+            dates,
+            signal_f.shift(1).bfill(),
+            base=100.0,
+            base_rate=0.0018,
+            scale=0.0018,
         ),
         "case_shiller": _fixture_monthly_level(
             dates,
@@ -2024,6 +2396,7 @@ def render_overview(
 def render_leading_signals(reports: list[ValidationReport]) -> None:
     st.header("Leading Signals")
     approved_reports = [report for report in reports if report.approved]
+    st.caption(f"승인 {len(approved_reports)}개 / 전체 {len(reports)}개 pair")
     if not approved_reports:
         st.warning("검증 기준을 통과한 선행지표가 아직 없습니다. 하단 Data QA에서 거절 사유를 확인해 주세요.")
         return
