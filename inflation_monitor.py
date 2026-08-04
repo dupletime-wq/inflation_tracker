@@ -1382,14 +1382,13 @@ def _fetch_ism_direct_pages(
             break
 
         value = _parse_ism_prices_from_text(text)
-        observation = _parse_ism_observation_from_url(str(response.url))
-        if value is None or observation is None:
+        if value is None:
             parse_failures += 1
             continue
 
         rows.append(
             {
-                "date": observation,
+                "date": period.to_timestamp(),
                 "value": value,
                 "release_date": pd.Timestamp.today().normalize(),
             }
@@ -1479,7 +1478,10 @@ def _fetch_ism_roundup_pages(
 
 def fetch_ism_prices_paid(session: requests.Session) -> SourceResult:
     direct_frame, direct_insecure, direct_failures, direct_blocked = _fetch_ism_direct_pages(session)
-    roundup_frame, roundup_insecure, roundup_failures, roundup_blocked = _fetch_ism_roundup_pages(session)
+    try:
+        roundup_frame, roundup_insecure, roundup_failures, roundup_blocked = _fetch_ism_roundup_pages(session)
+    except Exception:
+        roundup_frame, roundup_insecure, roundup_failures, roundup_blocked = _empty_monthly_frame(), False, 0, False
 
     combined = pd.concat([direct_frame, roundup_frame], ignore_index=True)
     frame = _normalize_monthly_frame(combined)

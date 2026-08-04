@@ -302,3 +302,57 @@ def test_fixture_sources_include_ism_prices_paid():
     fixtures = im._build_fixture_sources()
     assert "ism_prices_paid" in fixtures
     assert fixtures["ism_prices_paid"].ok
+
+
+# ---------------------------------------------------------------------------
+# ISM direct-page fetch must not mislabel prior-year months with this year
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_ism_direct_pages_uses_requested_period_not_response_url():
+    """A response URL like '.../pmi/september/' carries no year. Prior-year
+    months walked in a months_back window must not be stamped with the
+    current year just because the URL lacks one."""
+
+    class _FakeResponse:
+        def __init__(self, url: str, text: str) -> None:
+            self.url = url
+            self.text = text
+
+    def fake_request(session, url, **kwargs):
+        # No year segment in the URL, mirroring the real ISM site's direct pages.
+        return _FakeResponse(url, "The Prices Index registered 58.0 percent."), False
+
+    with patch.object(im, "_request", side_effect=fake_request):
+        frame, insecure, failures, blocked = im._fetch_ism_direct_pages(im._new_session(), months_back=12)
+
+    assert not blocked
+    assert failures == 0
+    assert not frame.empty
+    current_year = im._utc_now().year
+    # A 12-month lookback from "now" must span two different years
+    # (the whole point of this regression test).
+    assert frame["date"].dt.year.nunique() == 2
+    assert set(frame["date"].dt.year) == {current_year - 1, current_year}
+
+
+# ---------------------------------------------------------------------------
+# ISM roundup (sitemap) failures must not discard already-fetched direct rows
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_ism_prices_paid_keeps_direct_rows_when_roundup_fails():
+    direct_frame = im._normalize_monthly_frame(
+        pd.DataFrame(
+            {
+                "date": pd.date_range("2024-01-01", periods=3, freq="MS"),
+                "value": [58.0, 59.0, 60.0],
+            }
+        )
+    )
+    with patch.object(im, "_fetch_ism_direct_pages", return_value=(direct_frame, False, 0, False)), \
+         patch.object(im, "_fetch_ism_roundup_pages", side_effect=im.requests.exceptions.ConnectionError("sitemap down")):
+        result = im.fetch_ism_prices_paid(im._new_session())
+
+    assert result.ok
+    assert result.row_count == 3
