@@ -341,15 +341,38 @@ def test_fetch_ism_direct_pages_uses_requested_period_not_response_url():
 # ---------------------------------------------------------------------------
 
 
-def test_request_does_not_retry_plain_timeout():
-    """A plain read timeout is not a TLS problem, so retrying with
-    verify=False would just wait out a second identical timeout for
-    nothing. It should propagate immediately instead of doubling the wait."""
+def test_request_retries_transient_timeout_and_can_recover():
+    """A read timeout can be a transient network blip. It should get a real
+    second attempt (not a pointless verify=False toggle) and succeed if the
+    retry works."""
     session = im._new_session()
-    with patch.object(session, "request", side_effect=im.requests.exceptions.ReadTimeout("boom")) as mocked:
+    ok_response = MagicMock()
+    ok_response.raise_for_status.return_value = None
+    calls: list[bool] = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(kwargs.get("verify"))
+        if len(calls) == 1:
+            raise im.requests.exceptions.ReadTimeout("boom")
+        return ok_response
+
+    with patch.object(session, "request", side_effect=fake_request), \
+         patch.object(im.time, "sleep") as mocked_sleep:
+        response, insecure = im._request(session, "https://example.test")
+
+    assert response is ok_response
+    assert insecure is False
+    assert calls == [True, True]
+    mocked_sleep.assert_called_once()
+
+
+def test_request_gives_up_after_exhausting_timeout_retries():
+    session = im._new_session()
+    with patch.object(session, "request", side_effect=im.requests.exceptions.ReadTimeout("boom")) as mocked, \
+         patch.object(im.time, "sleep"):
         with pytest.raises(im.requests.exceptions.ReadTimeout):
             im._request(session, "https://example.test")
-    assert mocked.call_count == 1
+    assert mocked.call_count == im.NETWORK_RETRY_ATTEMPTS
 
 
 def test_request_retries_once_on_ssl_error():
