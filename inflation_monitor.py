@@ -9,6 +9,7 @@ from io import BytesIO, StringIO
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 from urllib.parse import urljoin
 from urllib.parse import urlencode
@@ -81,6 +82,8 @@ PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
 MONTHLY_CACHE_TTL_SECONDS = 60 * 60 * 6
 CLEVELAND_CACHE_TTL_SECONDS = 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 40
+NETWORK_RETRY_ATTEMPTS = 2
+NETWORK_RETRY_BACKOFF_SECONDS = 1.5
 NBS_MAX_WORKERS = 6
 FRED_MAX_WORKERS = 8
 SNAPSHOT_DIR = Path(".cache")
@@ -486,30 +489,35 @@ def _request(
     headers: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[requests.Response, bool]:
-    try:
-        response = session.request(
-            method,
-            url,
-            params=params,
-            data=data,
-            headers=headers,
-            timeout=timeout,
-            verify=True,
-        )
-        response.raise_for_status()
-        return response, False
-    except requests.exceptions.SSLError:
-        response = session.request(
-            method,
-            url,
-            params=params,
-            data=data,
-            headers=headers,
-            timeout=timeout,
-            verify=False,
-        )
-        response.raise_for_status()
-        return response, True
+    verify = True
+    last_exc: Exception | None = None
+    for attempt in range(NETWORK_RETRY_ATTEMPTS):
+        try:
+            response = session.request(
+                method,
+                url,
+                params=params,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+                verify=verify,
+            )
+            response.raise_for_status()
+            return response, not verify
+        except requests.exceptions.SSLError:
+            if verify:
+                # A cert-validation failure isn't a transient network issue;
+                # fall back to an insecure request rather than burning a retry.
+                verify = False
+                continue
+            raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < NETWORK_RETRY_ATTEMPTS - 1:
+                time.sleep(NETWORK_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            raise
+    raise last_exc  # pragma: no cover - unreachable, loop always returns or raises
 
 
 def _request_text(
