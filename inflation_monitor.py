@@ -133,6 +133,7 @@ DISPLAY_LABELS = {
     "atlanta_sticky_cpi": "Atlanta Sticky CPI",
     "atlanta_wage_growth": "Atlanta Wage Growth",
     "china_ppi_yoy": "China PPI YoY",
+    "ism_prices_paid": "ISM Prices Paid",
 }
 
 MONTH_TO_NUMBER = {
@@ -311,6 +312,17 @@ LEADING_SPECS: tuple[IndicatorSpec, ...] = (
         note="Core producer prices are tested as a lead for core CPI.",
     ),
     IndicatorSpec(
+        key="ism_prices_paid_to_headline_ppi",
+        title="ISM Prices Paid -> Headline PPI",
+        indicator_key="ism_prices_paid",
+        target_key="headline_ppi",
+        indicator_transform="raw",
+        target_transform="yoy",
+        lag_min=0,
+        lag_max=6,
+        note="ISM manufacturing prices-paid survey is a classic early read on producer-price pressure.",
+    ),
+    IndicatorSpec(
         key="china_ppi_to_import_prices",
         title="China PPI -> Import Prices from China",
         indicator_key="china_ppi_yoy",
@@ -337,6 +349,7 @@ MONTHLY_SOURCE_KEYS = frozenset(
         "atlanta_wage_growth",
         "atlanta_sticky_cpi",
         "china_ppi_yoy",
+        "ism_prices_paid",
     }
 )
 CLEVELAND_SOURCE_KEYS = frozenset({"cleveland_nowcast_month", "cleveland_nowcast_quarter"})
@@ -610,10 +623,7 @@ def fetch_fred_series(
     label: str,
 ) -> SourceResult:
     url = FRED_GRAPH_URL.format(series_id=series_id)
-    del session
-    response = requests.get(url, timeout=20, verify=False)
-    response.raise_for_status()
-    text = response.text
+    text, insecure_tls = _request_text(session, url)
     data = pd.read_csv(StringIO(text))
     data = data.rename(columns={data.columns[0]: "date", data.columns[1]: "value"})
     frame = _normalize_monthly_frame(data[["date", "value"]])
@@ -622,7 +632,7 @@ def fetch_fred_series(
         label,
         frame,
         f"https://fred.stlouisfed.org/series/{series_id}",
-        insecure_tls=True,
+        insecure_tls=insecure_tls,
     )
 
 
@@ -852,11 +862,8 @@ def _fetch_nbs_archive_page(page_number: int) -> tuple[int, list[tuple[str, str]
     page_url = urljoin(NBS_ARCHIVE_URL, suffix)
     try:
         response, insecure_tls = _request(session, page_url)
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else None
-        if status_code == 404:
-            return page_number, [], False
-        raise
+    except requests.RequestException:
+        return page_number, [], False
 
     soup = BeautifulSoup(response.text, "html.parser")
     page_links: list[tuple[str, str]] = []
@@ -892,7 +899,11 @@ def _iter_nbs_archive_links(
             for page_number in range(1, max_pages + 1)
         }
         for future in as_completed(future_map):
-            page_results.append(future.result())
+            page_number = future_map[future]
+            try:
+                page_results.append(future.result())
+            except Exception:
+                page_results.append((page_number, [], False))
 
     for _, page_links, insecure_tls in sorted(page_results, key=lambda item: item[0]):
         insecure_used = insecure_used or insecure_tls
@@ -1200,7 +1211,10 @@ def _restore_sources(payloads: dict[str, dict[str, Any]]) -> dict[str, SourceRes
 
 
 def fetch_china_ppi_yoy(session: requests.Session) -> SourceResult:
-    search_results, search_insecure = _iter_nbs_search_results(session)
+    try:
+        search_results, search_insecure = _iter_nbs_search_results(session)
+    except Exception:
+        search_results, search_insecure = [], False
     archive_links, archive_insecure = _iter_nbs_archive_links(session, max_pages=25)
     insecure_tls = search_insecure or archive_insecure
     rows: list[dict[str, Any]] = []
@@ -1276,11 +1290,11 @@ def _parse_ism_prices_from_text(text: str) -> float | None:
             re.IGNORECASE,
         ),
         re.compile(
-            r"Prices Index(?:[^.]{0,120})?(?:was|at|to)\s+(\d{1,3}(?:\.\d+)?)\s+percent",
+            r"Prices Index(?:[^.]{0,120}?)(?:was|at|to)\s+(\d{1,3}(?:\.\d+)?)\s+percent",
             re.IGNORECASE,
         ),
         re.compile(
-            r"prices paid(?:[^.]{0,120})?(\d{1,3}(?:\.\d+)?)\s+percent",
+            r"prices paid(?:[^.]{0,120}?)(\d{1,3}(?:\.\d+)?)\s+percent",
             re.IGNORECASE,
         ),
     )
@@ -1772,6 +1786,7 @@ def _build_fixture_sources() -> dict[str, SourceResult]:
         "china_ppi_yoy": ("China PPI YoY", NBS_ARCHIVE_URL, china_ppi_yoy),
         "atlanta_sticky_cpi": ("Atlanta Fed Sticky CPI", ATLANTA_STICKY_CPI_URL, sticky_cpi),
         "atlanta_wage_growth": ("Atlanta Fed Wage Growth Tracker", ATLANTA_WAGE_GROWTH_URL, wage_growth),
+        "ism_prices_paid": ("ISM Prices Paid", ISM_SITEMAP_URL, ism_prices),
     }
     for key, (label, url, frame) in extra_monthly.items():
         sources[key] = _finalize_source_result(key, label, frame, url)
@@ -1833,6 +1848,7 @@ def load_monthly_sources(_refresh_token: int = 0, force_live: bool = False) -> d
         ("atlanta_wage_growth", "Atlanta Fed Wage Growth Tracker", ATLANTA_WAGE_GROWTH_URL, fetch_atlanta_wage_growth),
         ("atlanta_sticky_cpi", "Atlanta Fed Sticky CPI", ATLANTA_STICKY_CPI_URL, fetch_atlanta_sticky_cpi),
         ("china_ppi_yoy", "China PPI YoY", NBS_ARCHIVE_URL, fetch_china_ppi_yoy),
+        ("ism_prices_paid", "ISM Prices Paid", ISM_SITEMAP_URL, fetch_ism_prices_paid),
     )
     for key, label, url, loader in loaders:
         try:
