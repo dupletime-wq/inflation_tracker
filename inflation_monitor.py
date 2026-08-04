@@ -82,6 +82,7 @@ MONTHLY_CACHE_TTL_SECONDS = 60 * 60 * 6
 CLEVELAND_CACHE_TTL_SECONDS = 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 40
 NBS_MAX_WORKERS = 6
+FRED_MAX_WORKERS = 8
 SNAPSHOT_DIR = Path(".cache")
 MONTHLY_SNAPSHOT_PATH = SNAPSHOT_DIR / "inflation_monitor_monthly_payload.pkl"
 CLEVELAND_SNAPSHOT_PATH = SNAPSHOT_DIR / "inflation_monitor_cleveland_payload.pkl"
@@ -497,7 +498,7 @@ def _request(
         )
         response.raise_for_status()
         return response, False
-    except (requests.exceptions.SSLError, requests.exceptions.Timeout):
+    except requests.exceptions.SSLError:
         response = session.request(
             method,
             url,
@@ -1834,16 +1835,25 @@ def load_monthly_sources(_refresh_token: int = 0, force_live: bool = False) -> d
     session = _new_session()
     results: dict[str, SourceResult] = {}
 
-    for key, (series_id, label) in FRED_SERIES.items():
-        try:
-            results[key] = fetch_fred_series(session, key=key, series_id=series_id, label=label)
-        except Exception as exc:
-            results[key] = _failed_source_result(
-                key,
-                label,
-                f"https://fred.stlouisfed.org/series/{series_id}",
-                str(exc),
-            )
+    fred_worker_count = min(FRED_MAX_WORKERS, len(FRED_SERIES))
+    with ThreadPoolExecutor(max_workers=fred_worker_count) as executor:
+        future_map = {
+            executor.submit(
+                fetch_fred_series, _new_session(), key=key, series_id=series_id, label=label
+            ): (key, series_id, label)
+            for key, (series_id, label) in FRED_SERIES.items()
+        }
+        for future in as_completed(future_map):
+            key, series_id, label = future_map[future]
+            try:
+                results[key] = future.result()
+            except Exception as exc:
+                results[key] = _failed_source_result(
+                    key,
+                    label,
+                    f"https://fred.stlouisfed.org/series/{series_id}",
+                    str(exc),
+                )
 
     loaders = (
         ("fao_food_price_index", "FAO Food Price Index", FAO_PAGE_URL, fetch_fao_food_price_index),

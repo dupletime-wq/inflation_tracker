@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -339,6 +339,68 @@ def test_fetch_ism_direct_pages_uses_requested_period_not_response_url():
 # ---------------------------------------------------------------------------
 # ISM roundup (sitemap) failures must not discard already-fetched direct rows
 # ---------------------------------------------------------------------------
+
+
+def test_request_does_not_retry_plain_timeout():
+    """A plain read timeout is not a TLS problem, so retrying with
+    verify=False would just wait out a second identical timeout for
+    nothing. It should propagate immediately instead of doubling the wait."""
+    session = im._new_session()
+    with patch.object(session, "request", side_effect=im.requests.exceptions.ReadTimeout("boom")) as mocked:
+        with pytest.raises(im.requests.exceptions.ReadTimeout):
+            im._request(session, "https://example.test")
+    assert mocked.call_count == 1
+
+
+def test_request_retries_once_on_ssl_error():
+    session = im._new_session()
+    ok_response = MagicMock()
+    ok_response.raise_for_status.return_value = None
+    verify_flags: list[bool] = []
+
+    def fake_request(method, url, **kwargs):
+        verify_flags.append(kwargs.get("verify"))
+        if kwargs.get("verify"):
+            raise im.requests.exceptions.SSLError("cert issue")
+        return ok_response
+
+    with patch.object(session, "request", side_effect=fake_request):
+        response, insecure = im._request(session, "https://example.test")
+
+    assert insecure is True
+    assert verify_flags == [True, False]
+
+
+# ---------------------------------------------------------------------------
+# FRED series are fetched concurrently, not one-by-one
+# ---------------------------------------------------------------------------
+
+
+def test_load_monthly_sources_fetches_all_fred_series(monkeypatch, tmp_path):
+    monkeypatch.setattr(im, "MONTHLY_SNAPSHOT_PATH", tmp_path / "monthly.pkl")
+    monkeypatch.delenv("INFLATION_MONITOR_FIXTURE_MODE", raising=False)
+
+    def fake_fetch_fred_series(session, *, key, series_id, label):
+        frame = im._normalize_monthly_frame(
+            pd.DataFrame({"date": pd.date_range("2024-01-01", periods=2, freq="MS"), "value": [1.0, 2.0]})
+        )
+        return im._finalize_source_result(key, label, frame, "https://example.test")
+
+    def fake_other_loader(key, label):
+        return lambda session: im._failed_source_result(key, label, "https://example.test", "skipped in test")
+
+    with patch.object(im, "fetch_fred_series", side_effect=fake_fetch_fred_series), \
+         patch.object(im, "fetch_fao_food_price_index", side_effect=fake_other_loader("fao_food_price_index", "FAO")), \
+         patch.object(im, "fetch_atlanta_wage_growth", side_effect=fake_other_loader("atlanta_wage_growth", "AWG")), \
+         patch.object(im, "fetch_atlanta_sticky_cpi", side_effect=fake_other_loader("atlanta_sticky_cpi", "ASC")), \
+         patch.object(im, "fetch_china_ppi_yoy", side_effect=fake_other_loader("china_ppi_yoy", "CPPI")), \
+         patch.object(im, "fetch_ism_prices_paid", side_effect=fake_other_loader("ism_prices_paid", "ISM")):
+        im.load_monthly_sources.clear()
+        payloads = im.load_monthly_sources(force_live=True)
+
+    assert set(im.FRED_SERIES.keys()).issubset(payloads.keys())
+    for key in im.FRED_SERIES:
+        assert payloads[key]["ok"], payloads[key]["detail"]
 
 
 def test_fetch_ism_prices_paid_keeps_direct_rows_when_roundup_fails():
