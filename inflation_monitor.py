@@ -86,6 +86,9 @@ NETWORK_RETRY_ATTEMPTS = 2
 NETWORK_RETRY_BACKOFF_SECONDS = 1.5
 NBS_MAX_WORKERS = 6
 FRED_MAX_WORKERS = 8
+FRED_REQUEST_TIMEOUT_SECONDS = 20
+FRED_RETRY_ATTEMPTS = 3
+FRED_RETRY_BACKOFF_SECONDS = 1.0
 SNAPSHOT_DIR = Path(".cache")
 MONTHLY_SNAPSHOT_PATH = SNAPSHOT_DIR / "inflation_monitor_monthly_payload.pkl"
 CLEVELAND_SNAPSHOT_PATH = SNAPSHOT_DIR / "inflation_monitor_cleveland_payload.pkl"
@@ -624,6 +627,40 @@ def _extract_series_from_book(
     return best_frame
 
 
+def _fetch_fred_csv(session: requests.Session, url: str) -> str:
+    """FRED-specific request path.
+
+    Empirically, plain unadorned requests (default requests User-Agent,
+    verify disabled) reach fred.stlouisfed.org reliably, while routing the
+    same host through the shared session's browser-spoofed headers with
+    certificate verification enabled tends to hang until it times out
+    instead of failing fast - consistent with a WAF/bot-mitigation soft
+    block on traffic that claims to be a browser without matching TLS
+    behavior. Use a leaner request shape for this host specifically, with
+    its own short timeout and retry budget, rather than the shared
+    verify-then-fallback `_request()` used by every other fetcher.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(FRED_RETRY_ATTEMPTS):
+        try:
+            response = session.request(
+                "GET",
+                url,
+                headers={"User-Agent": None, "Accept-Language": None},
+                timeout=FRED_REQUEST_TIMEOUT_SECONDS,
+                verify=False,
+            )
+            response.raise_for_status()
+            return response.text
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < FRED_RETRY_ATTEMPTS - 1:
+                time.sleep(FRED_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            raise
+    raise last_exc  # pragma: no cover - unreachable, loop always returns or raises
+
+
 def fetch_fred_series(
     session: requests.Session,
     *,
@@ -632,7 +669,8 @@ def fetch_fred_series(
     label: str,
 ) -> SourceResult:
     url = FRED_GRAPH_URL.format(series_id=series_id)
-    text, insecure_tls = _request_text(session, url)
+    text = _fetch_fred_csv(session, url)
+    insecure_tls = True
     data = pd.read_csv(StringIO(text))
     data = data.rename(columns={data.columns[0]: "date", data.columns[1]: "value"})
     frame = _normalize_monthly_frame(data[["date", "value"]])

@@ -234,31 +234,68 @@ def test_parse_ism_prices_from_text_returns_none_when_absent():
 
 
 # ---------------------------------------------------------------------------
-# fetch_fred_series honors the shared session and reports true TLS fallback
+# fetch_fred_series uses a lean, unspoofed request shape for FRED specifically
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_fred_series_uses_shared_session_and_reports_real_tls_state():
+def test_fetch_fred_series_parses_csv_and_reports_insecure_tls():
     csv_text = "DATE,CPIAUCSL\n2024-01-01,300.1\n2024-02-01,301.2\n"
 
-    with patch.object(im, "_request_text", return_value=(csv_text, False)) as mocked:
+    with patch.object(im, "_fetch_fred_csv", return_value=csv_text) as mocked:
         result = im.fetch_fred_series(
             im._new_session(), key="headline_cpi", series_id="CPIAUCSL", label="US CPI"
         )
 
     mocked.assert_called_once()
-    assert result.insecure_tls is False
+    # FRED requests intentionally skip TLS verification (see _fetch_fred_csv),
+    # so this must be reported honestly rather than hardcoded either way.
+    assert result.insecure_tls is True
     assert result.ok
     assert result.row_count == 2
 
 
-def test_fetch_fred_series_propagates_true_tls_fallback():
-    csv_text = "DATE,CPIAUCSL\n2024-01-01,300.1\n"
-    with patch.object(im, "_request_text", return_value=(csv_text, True)):
-        result = im.fetch_fred_series(
-            im._new_session(), key="headline_cpi", series_id="CPIAUCSL", label="US CPI"
-        )
-    assert result.insecure_tls is True
+def test_fetch_fred_csv_drops_spoofed_headers_and_disables_verification():
+    """Regression guard: FRED must not be sent the shared session's
+    browser-spoofed User-Agent/Accept-Language, and must use verify=False -
+    this is the exact request shape that was empirically shown to work,
+    versus the hardened shared-session shape which stalled until timeout."""
+    session = im._new_session()
+    ok_response = MagicMock()
+    ok_response.raise_for_status.return_value = None
+    ok_response.text = "DATE,CPIAUCSL\n2024-01-01,300.1\n"
+    captured: dict = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(kwargs)
+        return ok_response
+
+    with patch.object(session, "request", side_effect=fake_request):
+        text = im._fetch_fred_csv(session, "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL")
+
+    assert text == ok_response.text
+    assert captured["headers"] == {"User-Agent": None, "Accept-Language": None}
+    assert captured["verify"] is False
+    assert captured["timeout"] == im.FRED_REQUEST_TIMEOUT_SECONDS
+
+
+def test_fetch_fred_csv_retries_transient_timeout():
+    session = im._new_session()
+    ok_response = MagicMock()
+    ok_response.raise_for_status.return_value = None
+    ok_response.text = "DATE,CPIAUCSL\n2024-01-01,300.1\n"
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise im.requests.exceptions.ReadTimeout("boom")
+        return ok_response
+
+    with patch.object(session, "request", side_effect=fake_request), patch.object(im.time, "sleep"):
+        text = im._fetch_fred_csv(session, "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL")
+
+    assert text == ok_response.text
+    assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------
